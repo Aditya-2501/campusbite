@@ -8,7 +8,7 @@ CampusBite is a campus restaurant ordering and delivery app. Customers can find 
 - FastAPI, Pydantic, SQLAlchemy 2
 - PostgreSQL in Docker Compose (SQLite is available for a quick local backend)
 - JWT bearer authentication and bcrypt password hashing
-- Gemini API via Google's official Python SDK for customer order insights
+- OpenAI Responses API for customer order insights
 
 ## Features
 
@@ -20,7 +20,7 @@ CampusBite is a campus restaurant ordering and delivery app. Customers can find 
 - Reviews after delivery and one return/refund request per order
 - Owner restaurant menu CRUD, order dashboard, stats, reminder generation, and refund decisions
 - Partner-only assigned deliveries and delivery history
-- Customer scoped Gemini order insights using that customer's database history
+- Customer scoped AI insights using the authenticated customer's database history
 - Request method/path/status/duration logging and a response time header
 
 ## Run the backend with Docker Compose
@@ -56,7 +56,7 @@ Use the registration form to create an account, choosing Customer, Restaurant Ow
 
 ## Environment variables
 
-See `.env.example`. `POSTGRES_PASSWORD` and `JWT_SECRET` must be changed for deployed environments. `GEMINI_API_KEY` enables order insights and stays on the backend. `GEMINI_MODEL` defaults to `gemini-3.8-flash`. Gemini free-tier model access and quotas depend on Google's current terms; free-tier prompts may be used to improve Google products, so use test order data for the demo. See the [Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing) before deployment. Never commit `.env` files or real credentials.
+See `.env.example`. `POSTGRES_PASSWORD` and `JWT_SECRET` must be changed for deployed environments. `OPENAI_API_KEY` enables order insights and stays on the backend; API usage requires an OpenAI API account with available credits. `OPENAI_MODEL` defaults to `gpt-4o-mini`. Never commit `.env` files or real credentials.
 
 ## API overview
 
