@@ -8,7 +8,7 @@ CampusBite is a campus restaurant ordering and delivery app. Customers can find 
 - FastAPI, Pydantic, SQLAlchemy 2
 - PostgreSQL in Docker Compose (SQLite is available for a quick local backend)
 - JWT bearer authentication and bcrypt password hashing
-- OpenAI Responses API for customer order insights
+- OpenAI Responses API for customer order insights(I have used gemini, openai api key had some issues so...)
 
 ## Features
 
