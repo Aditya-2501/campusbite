@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -10,7 +11,8 @@ import jwt
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from openai import OpenAI, RateLimitError
+from google import genai
+from google.genai import errors as genai_errors
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
@@ -420,13 +422,31 @@ def owner_dashboard(background_tasks: BackgroundTasks, user: Annotated[User, Dep
 
 @app.post("/api/insights")
 def insights(data: InsightIn, user: Annotated[User, Depends(require_role("customer"))], db: Annotated[Session, Depends(db_session)]):
-    if not os.getenv("OPENAI_API_KEY"): raise HTTPException(503, "Order insights are unavailable until OPENAI_API_KEY is configured")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key: raise HTTPException(503, "Order insights are unavailable until GEMINI_API_KEY is configured")
     rows = db.scalars(select(Order).where(Order.customer_id == user.id).order_by(Order.created_at.desc()).limit(100)).all()
     context = [{"id": o.id, "restaurant": o.restaurant.name, "status": o.status, "total": o.total, "date": o.created_at.isoformat(), "items": [{"name": i.name, "quantity": i.quantity} for i in o.items]} for o in rows]
     try:
-        response = OpenAI().responses.create(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), input=[{"role": "system", "content": "Answer only from this customer's order history. If it lacks an answer, say so. Never infer another customer's data."}, {"role": "user", "content": f"Order history: {context}\n\nQuestion: {data.question}"}])
-        return {"answer": response.output_text}
-    except RateLimitError:
-        raise HTTPException(429, "Order insights are busy right now. Please wait a moment and try again.")
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            contents=f"Customer order history (newest first):\n{json.dumps(context, ensure_ascii=False)}\n\nCustomer question: {data.question}",
+            config=genai.types.GenerateContentConfig(
+                system_instruction="Answer using only this authenticated customer's order history. Do not invent orders or facts. If the history is empty or does not answer the question, say so. Never infer or reveal another customer's information.",
+                temperature=0.2,
+            ),
+        )
+        answer = (response.text or "").strip()
+        if not answer: raise HTTPException(502, "Gemini returned an empty response. Please try again.")
+        return {"answer": answer}
+    except HTTPException:
+        raise
+    except genai_errors.APIError as exc:
+        if exc.code == 429:
+            raise HTTPException(429, "Gemini's free-tier quota or rate limit was reached. Please wait and try again later.")
+        if exc.code == 401:
+            raise HTTPException(503, "Gemini rejected the API key. Check GEMINI_API_KEY in the backend environment.")
+        log.error("Gemini insights request failed with status %s", exc.code)
+        raise HTTPException(502, "Could not generate insights right now. Please try again later.")
     except Exception:
-        log.exception("OpenAI insights request failed"); raise HTTPException(502, "Could not generate insights right now. Please try again later.")
+        log.exception("Gemini insights request failed"); raise HTTPException(502, "Could not generate insights right now. Please try again later.")
