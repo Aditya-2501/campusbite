@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import json
+import hmac
 import logging
 import os
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from threading import Lock
 from typing import Annotated
 
 import jwt
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from google import genai
 from google.genai import errors as genai_errors
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, create_engine, func, inspect, select, text, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +30,9 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 JWT_ALGORITHM = "HS256"
 TOKEN_MINUTES = int(os.getenv("TOKEN_EXPIRE_MINUTES", "1440"))
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+_rate_limit_lock = Lock()
+_request_times: dict[str, deque[float]] = defaultdict(deque)
 password_hash = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -64,7 +71,7 @@ class MenuItem(Base):
     name: Mapped[str] = mapped_column(String(160))
     description: Mapped[str] = mapped_column(Text, default="")
     category: Mapped[str] = mapped_column(String(80), default="Mains")
-    price: Mapped[float] = mapped_column(Float)
+    price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     image: Mapped[str] = mapped_column(String(500), default="")
     available: Mapped[bool] = mapped_column(Boolean, default=True)
     restaurant: Mapped[Restaurant] = relationship(back_populates="items")
@@ -78,7 +85,7 @@ class Order(Base):
     delivery_partner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="PLACED")
     payment_status: Mapped[str] = mapped_column(String(30), default="mock_paid")
-    total: Mapped[float] = mapped_column(Float)
+    total: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     delivery_address: Mapped[str] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -97,7 +104,7 @@ class OrderItem(Base):
     menu_item_id: Mapped[int] = mapped_column(ForeignKey("menu_items.id"), nullable=True)
     name: Mapped[str] = mapped_column(String(160))
     quantity: Mapped[int] = mapped_column(Integer)
-    unit_price: Mapped[float] = mapped_column(Float)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
 
 
 class Ledger(Base):
@@ -105,7 +112,7 @@ class Ledger(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
     type: Mapped[str] = mapped_column(String(30))
-    amount: Mapped[float] = mapped_column(Float)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     status: Mapped[str] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -141,20 +148,21 @@ class Reminder(Base):
 
 class RegisterIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
-    email: str
+    email: str = Field(min_length=3, max_length=255, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     password: str = Field(min_length=8)
     role: str = "customer"
-    phone: str = ""
-    address: str = ""
+    invitation_code: str = Field(default="", max_length=256)
+    phone: str = Field(default="", max_length=40)
+    address: str = Field(default="", max_length=500)
 
 
-class LoginIn(BaseModel): email: str; password: str
-class MenuIn(BaseModel): name: str; description: str = ""; category: str = "Mains"; price: float = Field(gt=0); image: str = ""; available: bool = True
+class LoginIn(BaseModel): email: str = Field(min_length=3, max_length=255); password: str = Field(min_length=1, max_length=128)
+class MenuIn(BaseModel): name: str = Field(min_length=2, max_length=160); description: str = Field(default="", max_length=2000); category: str = Field(default="Mains", max_length=80); price: Decimal = Field(gt=0, max_digits=10, decimal_places=2); image: str = Field(default="", max_length=500); available: bool = True
 class CartLine(BaseModel): menu_item_id: int; quantity: int = Field(gt=0, le=50)
-class CheckoutIn(BaseModel): restaurant_id: int; items: list[CartLine]; delivery_address: str = ""
-class StatusIn(BaseModel): status: str
-class AssignIn(BaseModel): delivery_partner_id: int
-class ReviewIn(BaseModel): rating: int = Field(ge=1, le=5); comment: str = ""
+class CheckoutIn(BaseModel): restaurant_id: int; items: list[CartLine] = Field(min_length=1, max_length=50); delivery_address: str = Field(default="", max_length=500)
+class StatusIn(BaseModel): status: str = Field(min_length=1, max_length=30)
+class AssignIn(BaseModel): delivery_partner_id: int = Field(gt=0)
+class ReviewIn(BaseModel): rating: int = Field(ge=1, le=5); comment: str = Field(default="", max_length=2000)
 class ReturnIn(BaseModel): reason: str = Field(min_length=5, max_length=1500)
 class DecisionIn(BaseModel): approve: bool
 class InsightIn(BaseModel): question: str = Field(min_length=2, max_length=1000)
@@ -185,12 +193,43 @@ def require_role(*roles):
     return check
 
 
+def enforce_rate_limit(key: str, *, limit: int, window_seconds: int = 60):
+    """Per-process sliding window; use a shared store when running multiple workers."""
+    now = time.monotonic()
+    with _rate_limit_lock:
+        events = _request_times[key]
+        while events and now - events[0] >= window_seconds:
+            events.popleft()
+        if len(events) >= limit:
+            retry_after = max(1, int(window_seconds - (now - events[0])))
+            raise HTTPException(429, "Too many requests. Please wait and try again.", headers={"Retry-After": str(retry_after)})
+        events.append(now)
+        if len(_request_times) > 5000:
+            expired = [bucket for bucket, values in _request_times.items() if not values or now - values[-1] >= window_seconds]
+            for bucket in expired:
+                _request_times.pop(bucket, None)
+
+
+def validate_runtime_config():
+    if APP_ENV == "production":
+        if len(JWT_SECRET) < 32 or JWT_SECRET == "local-development-secret-change-me":
+            raise RuntimeError("Set a unique JWT_SECRET with at least 32 characters for production")
+        if "*" in os.getenv("CORS_ORIGINS", ""):
+            raise RuntimeError("CORS_ORIGINS must list explicit trusted origins in production")
+
+
 def order_dict(o: Order):
     return {"id": o.id, "status": o.status, "payment_status": o.payment_status, "total": o.total, "delivery_address": o.delivery_address, "created_at": o.created_at.isoformat(), "updated_at": o.updated_at.isoformat(), "restaurant": {"id": o.restaurant.id, "name": o.restaurant.name}, "customer": {"name": o.customer.name, "phone": o.customer.phone}, "delivery_partner": user_payload(o.delivery_partner) if o.delivery_partner else None, "return_request": ({"status": o.return_request.status, "reason": o.return_request.reason} if o.return_request else None), "review": ({"rating": o.review.rating, "comment": o.review.comment} if o.review else None), "items": [{"name": i.name, "quantity": i.quantity, "unit_price": i.unit_price} for i in o.items]}
 
 
+def restaurant_ratings(db: Session):
+    rows = db.execute(select(Order.restaurant_id, func.avg(Review.rating), func.count(Review.id)).join(Review, Review.order_id == Order.id).group_by(Order.restaurant_id)).all()
+    return {restaurant_id: {"rating": round(float(average), 1), "review_count": count} for restaurant_id, average, count in rows}
+
+
 def seed():
     Base.metadata.create_all(engine)
+    migrate_legacy_money_columns()
     with SessionLocal() as db:
         if db.scalar(select(Restaurant.id).limit(1)): return
         restaurants = [
@@ -206,8 +245,32 @@ def seed():
         db.commit()
 
 
+def migrate_legacy_money_columns():
+    """Convert legacy PostgreSQL float money columns to fixed precision without dropping data."""
+    if engine.dialect.name != "postgresql":
+        return
+    money_columns = {
+        "menu_items": ("price",),
+        "orders": ("total",),
+        "order_items": ("unit_price",),
+        "payment_ledger": ("amount",),
+    }
+    inspector = inspect(engine)
+    for table, names in money_columns.items():
+        existing = {column["name"]: column["type"] for column in inspector.get_columns(table)}
+        for column in names:
+            current_type = existing.get(column)
+            if current_type is None or (isinstance(current_type, Numeric) and current_type.precision == 12 and current_type.scale == 2):
+                continue
+            with engine.begin() as connection:
+                connection.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE NUMERIC(12, 2) USING ROUND({column}::numeric, 2)"))
+
+
 app = FastAPI(title="CampusBite API", version="1.0.0", description="CampusBite restaurant ordering and delivery API")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
+if APP_ENV != "production":
+    allowed_origins = sorted(set(allowed_origins) | {f"http://localhost:{port}" for port in range(5173, 5181)})
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.middleware("http")
@@ -217,7 +280,9 @@ async def request_logging(request, call_next):
 
 
 @app.on_event("startup")
-def on_startup(): seed()
+def on_startup():
+    validate_runtime_config()
+    seed()
 
 
 @app.get("/api/health")
@@ -227,6 +292,11 @@ def health(): return {"status": "ok", "service": "CampusBite"}
 @app.post("/api/auth/register", status_code=201)
 def register(data: RegisterIn, db: Annotated[Session, Depends(db_session)]):
     if data.role not in {"customer", "owner", "delivery"}: raise HTTPException(400, "Role must be customer, owner or delivery")
+    if data.role in {"owner", "delivery"}:
+        code_name = "OWNER_REGISTRATION_CODE" if data.role == "owner" else "DELIVERY_REGISTRATION_CODE"
+        configured_code = os.getenv(code_name, "")
+        if not configured_code or not hmac.compare_digest(data.invitation_code, configured_code):
+            raise HTTPException(403, f"A valid {data.role} invitation code is required")
     if len(data.password.encode("utf-8")) > 72: raise HTTPException(422, "Password must be at most 72 UTF-8 bytes")
     email = data.email.strip().lower()
     if db.scalar(select(User).where(User.email == email)): raise HTTPException(409, "Email is already registered")
@@ -238,7 +308,9 @@ def register(data: RegisterIn, db: Annotated[Session, Depends(db_session)]):
 
 
 @app.post("/api/auth/login")
-def login(data: LoginIn, db: Annotated[Session, Depends(db_session)]):
+def login(data: LoginIn, request: Request, db: Annotated[Session, Depends(db_session)]):
+    enforce_rate_limit(f"login:{request.client.host if request.client else 'unknown'}", limit=10)
+    if len(data.password.encode("utf-8")) > 72: raise HTTPException(422, "Password must be at most 72 UTF-8 bytes")
     user = db.scalar(select(User).where(User.email == data.email.strip().lower()))
     if not user or not password_hash.verify(data.password, user.password_hash): raise HTTPException(401, "Email or password is incorrect")
     return {"access_token": token_for(user), "token_type": "bearer", "user": user_payload(user)}
@@ -252,7 +324,8 @@ def me(user: Annotated[User, Depends(current_user)]): return user_payload(user)
 def restaurants(db: Annotated[Session, Depends(db_session)], search: str = ""):
     query = select(Restaurant)
     if search: query = query.where(Restaurant.name.ilike(f"%{search}%") | Restaurant.cuisine.ilike(f"%{search}%"))
-    return [{"id": r.id, "name": r.name, "cuisine": r.cuisine, "description": r.description, "image": r.image, "rating": r.rating, "eta": r.eta, "menu_count": len([i for i in r.items if i.available]), "categories": sorted({i.category.lower() for i in r.items if i.available})} for r in db.scalars(query).all()]
+    ratings = restaurant_ratings(db)
+    return [{"id": r.id, "name": r.name, "cuisine": r.cuisine, "description": r.description, "image": r.image, **ratings.get(r.id, {"rating": None, "review_count": 0}), "eta": r.eta, "accepting_orders": r.owner_id is not None, "menu_count": len([i for i in r.items if i.available]), "categories": sorted({i.category.lower() for i in r.items if i.available})} for r in db.scalars(query).all()]
 
 
 @app.get("/api/restaurants/{restaurant_id}")
@@ -265,13 +338,43 @@ def restaurant_detail(restaurant_id: int, db: Annotated[Session, Depends(db_sess
     if max_price is not None: query = query.where(MenuItem.price <= max_price)
     total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
     query = query.offset((page - 1) * page_size).limit(page_size)
-    return {"id": r.id, "name": r.name, "cuisine": r.cuisine, "description": r.description, "image": r.image, "rating": r.rating, "eta": r.eta, "items": [{"id": i.id, "name": i.name, "description": i.description, "category": i.category, "price": i.price, "image": i.image, "available": i.available} for i in db.scalars(query).all()], "page": page, "page_size": page_size, "total": total}
+    rating = restaurant_ratings(db).get(r.id, {"rating": None, "review_count": 0})
+    return {"id": r.id, "name": r.name, "cuisine": r.cuisine, "description": r.description, "image": r.image, **rating, "eta": r.eta, "accepting_orders": r.owner_id is not None, "items": [{"id": i.id, "name": i.name, "description": i.description, "category": i.category, "price": i.price, "image": i.image, "available": i.available} for i in db.scalars(query).all()], "page": page, "page_size": page_size, "total": total}
 
 
 def owner_restaurant(db: Session, user: User, restaurant_id: int | None = None):
     r = db.scalar(select(Restaurant).where(Restaurant.owner_id == user.id, *([Restaurant.id == restaurant_id] if restaurant_id else [])))
     if not r: raise HTTPException(404, "Restaurant not found for this owner")
     return r
+
+
+@app.get("/api/owner/claimable-restaurants")
+def claimable_restaurants(user: Annotated[User, Depends(require_role("owner"))], db: Annotated[Session, Depends(db_session)]):
+    return [{"id": r.id, "name": r.name, "cuisine": r.cuisine} for r in db.scalars(select(Restaurant).where(Restaurant.owner_id.is_(None)).order_by(Restaurant.name)).all()]
+
+
+@app.post("/api/owner/claimable-restaurants/{restaurant_id}")
+def claim_restaurant(restaurant_id: int, user: Annotated[User, Depends(require_role("owner"))], db: Annotated[Session, Depends(db_session)]):
+    current = db.scalars(select(Restaurant).where(Restaurant.owner_id == user.id)).all()
+    if current:
+        if len(current) != 1 or current[0].name != f"{user.name}'s Kitchen" or current[0].items:
+            raise HTTPException(409, "This account already has a restaurant in use and cannot claim a sample restaurant")
+        if db.scalar(select(Order.id).where(Order.restaurant_id == current[0].id).limit(1)):
+            raise HTTPException(409, "This account already has restaurant orders and cannot claim a sample restaurant")
+    try:
+        result = db.execute(update(Restaurant).where(Restaurant.id == restaurant_id, Restaurant.owner_id.is_(None)).values(owner_id=user.id))
+        if result.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "That restaurant has already been claimed")
+        if current:
+            db.delete(current[0])
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    return {"id": restaurant_id, "message": "Restaurant claimed successfully"}
 
 
 @app.post("/api/owner/menu", status_code=201)
@@ -293,9 +396,14 @@ def update_menu(item_id: int, data: MenuIn, user: Annotated[User, Depends(requir
     db.commit(); return {"id": item.id, **data.model_dump()}
 
 
-def owner_orders(db: Session, user: User):
-    r = owner_restaurant(db, user)
-    return db.scalars(select(Order).where(Order.restaurant_id == r.id).order_by(Order.created_at.desc())).all()
+@app.delete("/api/owner/menu/{item_id}", status_code=204)
+def delete_menu(item_id: int, user: Annotated[User, Depends(require_role("owner"))], db: Annotated[Session, Depends(db_session)]):
+    item = db.get(MenuItem, item_id)
+    if not item or item.restaurant.owner_id != user.id: raise HTTPException(404, "Menu item not found")
+    # Keep order snapshots intact while removing the live catalog reference.
+    db.execute(update(OrderItem).where(OrderItem.menu_item_id == item.id).values(menu_item_id=None))
+    db.delete(item); db.commit()
+    return Response(status_code=204)
 
 
 @app.post("/api/orders", status_code=201)
@@ -305,11 +413,12 @@ def checkout(data: CheckoutIn, user: Annotated[User, Depends(require_role("custo
     if len(delivery_address) < 5: raise HTTPException(400, "A delivery address is required")
     restaurant = db.get(Restaurant, data.restaurant_id)
     if not restaurant: raise HTTPException(404, "Restaurant not found")
+    if restaurant.owner_id is None: raise HTTPException(409, "This sample restaurant is not accepting orders until an owner claims it")
     ids = [line.menu_item_id for line in data.items]
     products = {i.id: i for i in db.scalars(select(MenuItem).where(MenuItem.id.in_(ids), MenuItem.restaurant_id == restaurant.id)).all()}
     if len(products) != len(set(ids)): raise HTTPException(400, "One or more items do not belong to this restaurant")
     if any(not products[line.menu_item_id].available for line in data.items): raise HTTPException(400, "A cart item is no longer available")
-    total = sum(products[x.menu_item_id].price * x.quantity for x in data.items)
+    total = sum((Decimal(str(products[x.menu_item_id].price)) * x.quantity for x in data.items), Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     order = Order(customer_id=user.id, restaurant_id=restaurant.id, total=total, delivery_address=delivery_address); db.add(order); db.flush()
     for line in data.items:
         product = products[line.menu_item_id]; db.add(OrderItem(order_id=order.id, menu_item_id=product.id, name=product.name, quantity=line.quantity, unit_price=product.price))
@@ -407,25 +516,29 @@ def make_reminders(restaurant_id: int):
     with SessionLocal() as db:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
         orders = db.scalars(select(Order).where(Order.restaurant_id == restaurant_id, Order.status.in_(["PLACED", "ACCEPTED"]), Order.updated_at < cutoff)).all()
+        existing = set(db.scalars(select(Reminder.order_id).where(Reminder.restaurant_id == restaurant_id)).all())
         for order in orders:
-            exists = db.scalar(select(Reminder.id).where(Reminder.order_id == order.id, Reminder.created_at > cutoff))
-            if not exists: db.add(Reminder(restaurant_id=restaurant_id, order_id=order.id, message=f"Order #{order.id} has been waiting for over 15 minutes."))
+            if order.id not in existing: db.add(Reminder(restaurant_id=restaurant_id, order_id=order.id, message=f"Order #{order.id} has been waiting for over 15 minutes."))
         db.commit()
 
 
 @app.get("/api/owner/dashboard")
-def owner_dashboard(background_tasks: BackgroundTasks, user: Annotated[User, Depends(require_role("owner"))], db: Annotated[Session, Depends(db_session)]):
-    r = owner_restaurant(db, user); background_tasks.add_task(make_reminders, r.id); orders = owner_orders(db, user)
+def owner_dashboard(user: Annotated[User, Depends(require_role("owner"))], db: Annotated[Session, Depends(db_session)]):
+    r = owner_restaurant(db, user); make_reminders(r.id); orders = db.scalars(select(Order).where(Order.restaurant_id == r.id).order_by(Order.created_at.desc()).limit(50)).all()
     reminders = db.scalars(select(Reminder).where(Reminder.restaurant_id == r.id).order_by(Reminder.created_at.desc()).limit(20)).all()
-    return {"restaurant": {"id": r.id, "name": r.name}, "stats": {"orders": sum(o.created_at.date() == datetime.now(timezone.utc).date() for o in orders), "active": sum(o.status not in {"DELIVERED", "CANCELLED", "REFUNDED"} for o in orders), "revenue": round(sum(o.total for o in orders if o.payment_status == "mock_paid"), 2)}, "orders": [order_dict(o) for o in orders[:50]], "reminders": [{"id": x.id, "order_id": x.order_id, "message": x.message, "created_at": x.created_at.isoformat()} for x in reminders]}
+    claimable = db.scalars(select(Restaurant).where(Restaurant.owner_id.is_(None)).order_by(Restaurant.name)).all()
+    today = datetime.now(timezone.utc).date()
+    stats = {"orders": db.scalar(select(func.count(Order.id)).where(Order.restaurant_id == r.id, func.date(Order.created_at) == today)) or 0, "active": db.scalar(select(func.count(Order.id)).where(Order.restaurant_id == r.id, Order.status.not_in(["DELIVERED", "CANCELLED", "REFUNDED"]))) or 0, "revenue": round(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(Order.restaurant_id == r.id, Order.payment_status == "mock_paid")) or 0, 2)}
+    return {"restaurant": {"id": r.id, "name": r.name}, "claimable_restaurants": [{"id": x.id, "name": x.name, "cuisine": x.cuisine} for x in claimable], "stats": stats, "orders": [order_dict(o) for o in orders], "reminders": [{"id": x.id, "order_id": x.order_id, "message": x.message, "created_at": x.created_at.isoformat()} for x in reminders]}
 
 
 @app.post("/api/insights")
 def insights(data: InsightIn, user: Annotated[User, Depends(require_role("customer"))], db: Annotated[Session, Depends(db_session)]):
+    enforce_rate_limit(f"insights:{user.id}", limit=int(os.getenv("GEMINI_REQUESTS_PER_MINUTE", "5")))
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise HTTPException(503, "Order insights are unavailable until GEMINI_API_KEY is configured")
     rows = db.scalars(select(Order).where(Order.customer_id == user.id).order_by(Order.created_at.desc()).limit(100)).all()
-    context = [{"id": o.id, "restaurant": o.restaurant.name, "status": o.status, "total": o.total, "date": o.created_at.isoformat(), "items": [{"name": i.name, "quantity": i.quantity} for i in o.items]} for o in rows]
+    context = [{"id": o.id, "restaurant": o.restaurant.name, "status": o.status, "total": float(o.total), "date": o.created_at.isoformat(), "items": [{"name": i.name, "quantity": i.quantity} for i in o.items]} for o in rows]
     try:
         client = genai.Client(
             api_key=api_key,
