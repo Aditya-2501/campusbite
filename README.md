@@ -56,7 +56,7 @@ Use the registration form to create an account, choosing Customer, Restaurant Ow
 
 ## Environment variables
 
-See `.env.example`. `POSTGRES_PASSWORD` and `JWT_SECRET` must be changed for deployed environments. `GEMINI_API_KEY` enables order insights and stays on the backend. `GEMINI_MODEL` defaults to `gemini-3.8-flash`. Gemini free-tier model access and quotas depend on Google's current terms; free-tier prompts may be used to improve Google products, so use test order data for the demo. See the [Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing) before deployment. Never commit `.env` files or real credentials.
+See `.env.example`. `POSTGRES_PASSWORD` and `JWT_SECRET` must be changed for deployed environments. `GEMINI_API_KEY` enables order insights and stays on the backend. `GEMINI_MODEL` defaults to `gemini-3.5-flash-lite`. Gemini free-tier model access and quotas depend on Google's current terms; free-tier prompts may be used to improve Google products, so use test order data for the demo. See the [Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing) before deployment. Never commit `.env` files or real credentials.
 
 ## API overview
 

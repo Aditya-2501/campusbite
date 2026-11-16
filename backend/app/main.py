@@ -427,13 +427,20 @@ def insights(data: InsightIn, user: Annotated[User, Depends(require_role("custom
     rows = db.scalars(select(Order).where(Order.customer_id == user.id).order_by(Order.created_at.desc()).limit(100)).all()
     context = [{"id": o.id, "restaurant": o.restaurant.name, "status": o.status, "total": o.total, "date": o.created_at.isoformat(), "items": [{"name": i.name, "quantity": i.quantity} for i in o.items]} for o in rows]
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai.types.HttpOptions(
+                timeout=30000,
+                retry_options=genai.types.HttpRetryOptions(attempts=1),
+            ),
+        )
         response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             contents=f"Customer order history (newest first):\n{json.dumps(context, ensure_ascii=False)}\n\nCustomer question: {data.question}",
             config=genai.types.GenerateContentConfig(
                 system_instruction="Answer using only this authenticated customer's order history. Do not invent orders or facts. If the history is empty or does not answer the question, say so. Never infer or reveal another customer's information.",
                 temperature=0.2,
+                max_output_tokens=512,
             ),
         )
         answer = (response.text or "").strip()
@@ -446,6 +453,10 @@ def insights(data: InsightIn, user: Annotated[User, Depends(require_role("custom
             raise HTTPException(429, "Gemini's free-tier quota or rate limit was reached. Please wait and try again later.")
         if exc.code == 401:
             raise HTTPException(503, "Gemini rejected the API key. Check GEMINI_API_KEY in the backend environment.")
+        if exc.code == 503:
+            raise HTTPException(503, "Gemini is temporarily busy. Please try again shortly.")
+        if exc.code == 404:
+            raise HTTPException(503, "The configured Gemini model is unavailable. Check GEMINI_MODEL in the backend environment.")
         log.error("Gemini insights request failed with status %s", exc.code)
         raise HTTPException(502, "Could not generate insights right now. Please try again later.")
     except Exception:
